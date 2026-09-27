@@ -95,4 +95,57 @@ public class FocusedResourceGuardTest {
         assertTrue(FocusedResourceGuard.isManagedPauseCause("focused resource guard: low memory"));
         assertFalse(FocusedResourceGuard.isManagedPauseCause("user request in Crawler_p"));
     }
+
+    @Test
+    public void onlyPersistedAutomaticResourcePausesSurviveStartup() {
+        assertTrue(FocusedResourceGuard.preservePauseOnStartup(true, true,
+                "resource observer: not enough memory space"));
+        assertTrue(FocusedResourceGuard.preservePauseOnStartup(true, true,
+                "focused resource guard: low JVM headroom"));
+        assertFalse(FocusedResourceGuard.preservePauseOnStartup(false, true,
+                "focused resource guard: low JVM headroom"));
+        assertFalse(FocusedResourceGuard.preservePauseOnStartup(true, false,
+                "focused resource guard: low JVM headroom"));
+        assertFalse(FocusedResourceGuard.preservePauseOnStartup(true, true, "operator pause"));
+    }
+
+    @Test
+    public void startupResourcePauseKeepsRecoveryMonitorActiveUnlessOperatorPaused() {
+        assertTrue(FocusedResourceGuard.autoResumeOnStartup(true, false));
+        assertFalse(FocusedResourceGuard.autoResumeOnStartup(true, true));
+        assertFalse(FocusedResourceGuard.autoResumeOnStartup(false, false));
+    }
+
+    @Test
+    public void systemGuardPreservesPhysicalAndSwapHeadroom() {
+        final long gib = 1024L * 1024L * 1024L;
+        assertTrue(FocusedResourceGuard.systemMemoryHealthy(2L * gib, 8L * gib,
+                12L * gib, 15L * gib));
+        assertFalse(FocusedResourceGuard.systemMemoryHealthy(gib, 8L * gib,
+                12L * gib, 15L * gib));
+        assertFalse(FocusedResourceGuard.systemMemoryHealthy(2L * gib, 8L * gib,
+                gib, 15L * gib));
+        assertTrue(FocusedResourceGuard.systemMemoryHealthy(-1L, -1L, -1L, -1L));
+    }
+
+    @Test
+    public void recoveryMessageUsesFreshMeasurementsRatherThanOldPauseHeadroom() {
+        final String refreshed = FocusedResourceGuard.recoveryPauseCause(
+                "focused resource guard: JVM headroom 52775208 bytes is below 1073741824 bytes",
+                2L * 1024L * 1024L * 1024L, 4L * 1024L * 1024L * 1024L,
+                3L * 1024L * 1024L * 1024L, 8L * 1024L * 1024L * 1024L,
+                12L * 1024L * 1024L * 1024L, 15L * 1024L * 1024L * 1024L, true);
+        assertTrue(refreshed.contains("awaiting second healthy recovery check"));
+        assertFalse(refreshed.contains("52775208"));
+    }
+
+    @Test
+    public void recoveryMessageReportsPhysicalMemoryPressureSeparately() {
+        final long gib = 1024L * 1024L * 1024L;
+        final String refreshed = FocusedResourceGuard.recoveryPauseCause(
+                "focused resource guard: JVM headroom 52775208 bytes is below 1073741824 bytes",
+                2L * gib, 4L * gib, gib, 8L * gib, 12L * gib, 15L * gib, true);
+        assertTrue(refreshed.contains("physical RAM available"));
+        assertTrue(refreshed.contains(Long.toString(gib)));
+    }
 }

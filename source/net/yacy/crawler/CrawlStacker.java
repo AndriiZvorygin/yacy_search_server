@@ -437,7 +437,7 @@ public final class CrawlStacker implements WorkflowTask<Request>{
                     CrawlStacker.log.fine("CrawlStacker.stackCrawl of URL " + entry.url().toNormalform(true) + " - not pushed to " + NoticedURL.StackType.NOLOAD + " stack : " + warning);
                 }
                 if (warning == null) this.focusedPolicyManager.recordAdmission(scoredContext, policyDecisions);
-                else this.focusedPolicyManager.recordAdmissionRejected(policyDecisions);
+                else this.focusedPolicyManager.recordAdmissionRejected(entry.url().hash(), policyDecisions);
                 return null;
             }
 
@@ -469,7 +469,7 @@ public final class CrawlStacker implements WorkflowTask<Request>{
         }
         if (warning != null && CrawlStacker.log.isFine()) CrawlStacker.log.fine("CrawlStacker.stackCrawl of URL " + entry.url().toNormalform(true) + " - not pushed: " + warning);
         if (warning == null) this.focusedPolicyManager.recordAdmission(scoredContext, policyDecisions);
-        else this.focusedPolicyManager.recordAdmissionRejected(policyDecisions);
+        else this.focusedPolicyManager.recordAdmissionRejected(entry.url().hash(), policyDecisions);
 
         return null;
     }

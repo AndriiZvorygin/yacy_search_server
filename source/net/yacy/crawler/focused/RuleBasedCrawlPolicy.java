@@ -10,10 +10,13 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import net.yacy.cora.document.id.DigestURL;
 
 /** Rule-based implementation suitable for shareable profile configuration. */
-public final class RuleBasedCrawlPolicy implements FocusedCrawlPolicy {
+public final class RuleBasedCrawlPolicy implements FocusedCrawlPolicy, AutoCloseable {
 
     private final PolicyConfiguration configuration;
     private final FocusedNoveltyState noveltyState;
@@ -28,24 +31,48 @@ public final class RuleBasedCrawlPolicy implements FocusedCrawlPolicy {
     @Override
     public PolicyConfiguration configuration() { return this.configuration; }
 
+    public synchronized JSONObject stateStatusJSON() {
+        final JSONObject result = new JSONObject(true);
+        try {
+            result.put("id", this.configuration.id())
+                    .put("novelty", this.noveltyState == null ? new JSONObject(true) : this.noveltyState.statusJSON())
+                    .put("admission", this.admissionState == null ? new JSONObject(true) : this.admissionState.statusJSON());
+        } catch (final JSONException e) {
+            throw new IllegalStateException("cannot serialize focused policy state", e);
+        }
+        return result;
+    }
+
     @Override
-    public CrawlPolicyDecision preFetch(final CrawlPolicyContext context) {
+    public synchronized CrawlPolicyDecision preFetch(final CrawlPolicyContext context) {
         if (!this.configuration.enabled() || context == null || context.url() == null) return CrawlPolicyDecision.ordinary("policy-disabled");
         return decide(context, false);
     }
 
     @Override
-    public CrawlPolicyDecision postFetch(final CrawlPolicyContext context) {
+    public synchronized CrawlPolicyDecision postFetch(final CrawlPolicyContext context) {
         if (!this.configuration.enabled() || context == null || context.url() == null) return CrawlPolicyDecision.ordinary("policy-disabled");
         return decide(context, true);
     }
 
     @Override
-    public void recordAdmission(final CrawlPolicyContext context, final CrawlPolicyDecision decision) {
+    public synchronized void recordAdmission(final CrawlPolicyContext context, final CrawlPolicyDecision decision) {
         if (this.admissionState == null || context == null || decision == null
                 || !this.configuration.id().equals(decision.policyId())
                 || decision.action() == CrawlPolicyDecision.Action.REJECT || !decision.focused()) return;
         this.admissionState.recordAdmission(context.url(), this.configuration.version());
+    }
+
+    @Override
+    public synchronized void recordIndexed(final byte[] urlHash) {
+        if (this.admissionState != null) this.admissionState.forget(urlHash);
+    }
+
+    /** Close profile-owned persistent stores when a profile is reloaded or YaCy shuts down. */
+    @Override
+    public synchronized void close() {
+        if (this.noveltyState != null) this.noveltyState.close();
+        if (this.admissionState != null) this.admissionState.close();
     }
 
     private CrawlPolicyDecision decide(final CrawlPolicyContext context, final boolean parsed) {

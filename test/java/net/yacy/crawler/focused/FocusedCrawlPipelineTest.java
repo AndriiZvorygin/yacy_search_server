@@ -2,16 +2,18 @@ package net.yacy.crawler.focused;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.Date;
 import java.util.List;
 
 import net.yacy.cora.document.id.DigestURL;
+import net.yacy.crawler.retrieval.Request;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Rule;
@@ -42,6 +44,7 @@ public class FocusedCrawlPipelineTest {
                         .put("thresholds", new JSONObject().put("probable", 10).put("focused", 20))
                         .put("rules", new JSONArray().put(new JSONObject().put("id", "nebula-topic")
                                 .put("score", 30).put("terms", new JSONArray().put("nebula")))))
+                .put("frontier", new JSONObject().put("enabled", true))
                 .put("collections", new JSONObject()
                         .put("astronomy-reference", new JSONObject()
                                 .put("terms", new JSONArray().put("spectroscopy"))
@@ -65,6 +68,10 @@ public class FocusedCrawlPipelineTest {
             assertEquals(1, parentDecisions.size());
             assertEquals(PolicyPriority.FOCUSED, parentDecisions.get(0).priority());
             manager.recordPreFetch(parentURL.hash(), parentDecisions);
+            final Request parentRequest = new Request(new byte[] {1, 2, 3}, parentURL, null, "nebula survey",
+                    new Date(), "123456789012", 0, 0);
+            manager.recordDiscovered(parentRequest, parentDecisions);
+            manager.recordAdmission(parentContext, parentDecisions);
 
             final int inheritedScore = manager.parentScore(parentURL.hash());
             assertEquals(30, inheritedScore);
@@ -84,19 +91,20 @@ public class FocusedCrawlPipelineTest {
             assertEquals(Collections.singleton("astronomy-reference"), postFetch.get(0).collections());
             manager.metadataStore().record(childURL.hash(), postFetch);
             manager.recordIndexed(childURL.hash());
-            final FocusedCrawlMetadata stored = manager.metadataStore().get(childURL.hash());
-            assertNotNull(stored);
-            assertEquals(Collections.singleton("astronomy-reference"), stored.collections());
-            assertEquals(40, stored.relevanceScore());
-            assertTrue(stored.reasonCodes().contains("nebula-topic"));
+            assertEquals(1, manager.metadataStore().statusJSON().optInt("records", -1));
+            assertEquals(Collections.singleton("astronomy-reference"), postFetch.get(0).collections());
+            assertEquals(40, postFetch.get(0).relevanceScore());
+            assertTrue(postFetch.get(0).reasonCodes().contains("nebula-topic"));
+
+            manager.recordIndexed(parentURL.hash());
+            assertEquals(0, manager.metadataStore().statusJSON().optInt("records", -1));
+            assertEquals(30, manager.parentScore(parentURL.hash()));
         }
 
         try (FocusedCrawlPolicyManager restarted = new FocusedCrawlPolicyManager(application.toFile(), data.toFile())) {
             final FocusedCrawlMetadata restored = restarted.metadataStore().get(childURL.hash());
-            assertNotNull(restored);
-            assertEquals("astronomy", restored.policyIds().get(0));
-            assertEquals(3, Integer.parseInt(restored.policyVersions().get(0)));
-            assertTrue(restored.collections().contains("astronomy-reference"));
+            assertNull(restored);
+            assertEquals(30, restarted.parentScore(parentURL.hash()));
             assertFalse(restarted.loadErrors().containsKey("astronomy.json"));
         }
     }

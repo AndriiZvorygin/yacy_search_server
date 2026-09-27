@@ -41,6 +41,7 @@ public final class FocusedCrawlMetadataStore implements AutoCloseable {
     private static final int CACHE_SIZE = 4096;
 
     private final MapHeap heap;
+    private final File heapFile;
     private final Map<String, FocusedCrawlMetadata> cache = new LinkedHashMap<String, FocusedCrawlMetadata>(128, 0.75f, true) {
         private static final long serialVersionUID = 1L;
 
@@ -51,18 +52,27 @@ public final class FocusedCrawlMetadataStore implements AutoCloseable {
     };
 
     public FocusedCrawlMetadataStore(final File stateDirectory) {
+        this.heapFile = new File(stateDirectory, "url-policy-metadata.heap");
         MapHeap opened = null;
         try {
             stateDirectory.mkdirs();
-            opened = new MapHeap(new File(stateDirectory, "url-policy-metadata.heap"),
+            opened = new MapHeap(this.heapFile,
                     Word.commonHashLength, NaturalOrder.naturalOrder, 1024 * 64, 512, ' ');
         } catch (final IOException ignored) { }
         this.heap = opened;
     }
 
+    /** Remember the current classification in the bounded hot cache only. */
+    public synchronized void remember(final byte[] urlHash, final List<CrawlPolicyDecision> decisions) {
+        final FocusedCrawlMetadata metadata = metadata(urlHash, decisions);
+        if (metadata == null) return;
+        final String key = cacheKey(urlHash);
+        this.cache.put(key, merge(get(urlHash), metadata));
+    }
+
+    /** Persist metadata only after YaCy has admitted the URL to its native queue. */
     public synchronized void record(final byte[] urlHash, final List<CrawlPolicyDecision> decisions) {
-        if (urlHash == null) return;
-        final FocusedCrawlMetadata metadata = FocusedCrawlMetadata.from(decisions);
+        final FocusedCrawlMetadata metadata = metadata(urlHash, decisions);
         if (metadata == null) return;
         final String key = cacheKey(urlHash);
         final FocusedCrawlMetadata effective = merge(get(urlHash), metadata);
@@ -80,6 +90,17 @@ public final class FocusedCrawlMetadataStore implements AutoCloseable {
             }
             this.cache.put(key, effective);
         } catch (final RuntimeException ignored) { }
+    }
+
+    /** Remove transient or terminal URL metadata and its key from the RAM index. */
+    public synchronized void forget(final byte[] urlHash) {
+        if (urlHash == null) return;
+        this.cache.remove(cacheKey(urlHash));
+        if (this.heap != null) {
+            try {
+                this.heap.delete(storageKey(urlHash));
+            } catch (final IOException | RuntimeException ignored) { }
+        }
     }
 
     public synchronized FocusedCrawlMetadata get(final byte[] urlHash) {
@@ -101,6 +122,28 @@ public final class FocusedCrawlMetadataStore implements AutoCloseable {
     public synchronized int score(final byte[] urlHash) {
         final FocusedCrawlMetadata metadata = get(urlHash);
         return metadata == null ? 0 : metadata.relevanceScore();
+    }
+
+    /** Cheap store diagnostics; {@link MapHeap#memoryBytes()} is an estimate. */
+    public synchronized JSONObject statusJSON() {
+        final JSONObject status = new JSONObject(true);
+        try {
+            status.put("records", this.heap == null ? 0 : this.heap.size())
+                    .put("estimatedIndexBytes", this.heap == null ? 0L : this.heap.memoryBytes())
+                    .put("heapFileBytes", this.heapFile.isFile() ? this.heapFile.length() : 0L)
+                    .put("mapHeapCacheEntries", this.heap == null ? 0 : this.heap.cacheSize())
+                    .put("metadataCacheEntries", this.cache.size())
+                    .put("metadataCacheLimit", CACHE_SIZE);
+        } catch (final JSONException e) {
+            throw new IllegalStateException("cannot serialize focused metadata store status", e);
+        }
+        return status;
+    }
+
+    private static FocusedCrawlMetadata metadata(final byte[] urlHash,
+            final List<CrawlPolicyDecision> decisions) {
+        if (urlHash == null) return null;
+        return FocusedCrawlMetadata.from(decisions);
     }
 
     private static FocusedCrawlMetadata merge(final FocusedCrawlMetadata previous,

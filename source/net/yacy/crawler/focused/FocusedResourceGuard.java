@@ -11,6 +11,7 @@ public final class FocusedResourceGuard {
 
     private static final long MIN_PAUSE_HEADROOM = 512L * 1024L * 1024L;
     private static final long MIN_RECOVERY_HEADROOM = 768L * 1024L * 1024L;
+    private static final long MIN_PHYSICAL_HEADROOM = 512L * 1024L * 1024L;
     private static final int REQUIRED_HEALTHY_CHECKS = 2;
 
     private int healthyChecks;
@@ -52,6 +53,58 @@ public final class FocusedResourceGuard {
 
     public static boolean isFocusedPauseCause(final String cause) {
         return cause != null && cause.startsWith("focused resource guard:");
+    }
+
+    /**
+     * Keep an automatically imposed local-crawler pause across restart. The
+     * focused scheduler then monitors recovery without admitting work until
+     * the resource guard has observed consecutive healthy checks.
+     */
+    public static boolean preservePauseOnStartup(final boolean paused, final boolean autodisabled,
+            final String cause) {
+        return paused && autodisabled && isManagedPauseCause(cause);
+    }
+
+    /** A startup resource hold is auto-resumable unless the operator paused the focused scheduler. */
+    public static boolean autoResumeOnStartup(final boolean persistedResourcePause,
+            final boolean operatorPaused) {
+        return persistedResourcePause && !operatorPaused;
+    }
+
+    /** Keep at least 20% of physical RAM (and 10% of swap) available to the OS and other services. */
+    public static boolean systemMemoryHealthy(final long physicalAvailable, final long physicalTotal,
+            final long swapFree, final long swapTotal) {
+        if (physicalAvailable >= 0L && physicalTotal > 0L
+                && physicalAvailable < physicalMemoryThreshold(physicalTotal)) return false;
+        return swapFree < 0L || swapTotal <= 0L || swapFree >= swapTotal / 10L;
+    }
+
+    public static long physicalMemoryThreshold(final long physicalTotal) {
+        if (physicalTotal <= 0L) return MIN_PHYSICAL_HEADROOM;
+        return Math.max(MIN_PHYSICAL_HEADROOM, physicalTotal / 5L);
+    }
+
+    /** Refresh the visible pause message with the last measured values instead of leaving stale startup data. */
+    public static String recoveryPauseCause(final String previousCause, final long heapAvailable,
+            final long heapMaximum, final long physicalAvailable, final long physicalTotal,
+            final long swapFree, final long swapTotal, final boolean diskHealthy) {
+        final String prefix = previousCause != null && previousCause.startsWith("resource observer:")
+                ? "resource observer: " : "focused resource guard: ";
+        if (!diskHealthy) return prefix + "waiting for disk space to recover; current JVM headroom "
+                + heapAvailable + " bytes";
+        if (!systemMemoryHealthy(physicalAvailable, physicalTotal, swapFree, swapTotal)) {
+            if (physicalTotal > 0L && physicalAvailable >= 0L
+                    && physicalAvailable < physicalMemoryThreshold(physicalTotal)) {
+                return prefix + "physical RAM available " + physicalAvailable + " bytes is below "
+                        + physicalMemoryThreshold(physicalTotal) + " bytes";
+            }
+            return prefix + "swap free space is below 10%; current JVM headroom " + heapAvailable + " bytes";
+        }
+        final long required = recoveryThreshold(heapMaximum);
+        if (heapAvailable < required) return prefix + "JVM headroom " + heapAvailable
+                + " bytes is below recovery threshold " + required + " bytes";
+        return prefix + "awaiting second healthy recovery check; current JVM headroom "
+                + heapAvailable + " bytes of " + heapMaximum + " bytes";
     }
 
     /** Headroom below which focused scheduling pauses native local crawling. */

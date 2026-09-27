@@ -101,13 +101,20 @@ Frontier recovery is bounded by `limits.refillBatchSize` for each profile
 (10,000 URLs by default, configurable up to 100,000). The Canada example uses
 a 3,000-URL batch after production measurements showed the larger batch
 triggering repeated memory pauses. The queue target remains independent of
-this per-cycle batch limit. The scheduler checks heap headroom
-while admitting a batch and pauses YaCy's native local crawl when headroom is
-below `max(512 MiB, 25% of maximum heap)`. It resumes only after two healthy
-checks above `max(768 MiB, 35% of maximum heap)`. The pause applies to native
-fetching already in progress as well as future refills; queued requests remain
-persisted. It never resumes a manual pause. The ordinary ResourceObserver pause
-and recovery path remains supported.
+this per-cycle batch limit. The scheduler checks JVM headroom and host memory
+before admitting a batch. It pauses YaCy's native local crawl when heap
+headroom is below `max(512 MiB, 25% of maximum heap)`, physical memory
+available is below 20% of host RAM, or free swap falls below 10%. On Linux,
+physical availability uses `MemAvailable` so reclaimable filesystem cache is
+not mistaken for unavailable RAM. Heap recovery requires two healthy checks
+above `max(768 MiB, 35% of maximum heap)`; host memory and disk must also be
+healthy. The pause applies to native fetching as well as future refills, while
+queued requests remain persisted. After restart, a managed resource pause
+stays in place while the focused scheduler continues monitoring it; the pause
+reason is refreshed from current measurements and the scheduler resumes after
+the same two-check recovery test. An explicit operator pause remains
+authoritative. The ordinary ResourceObserver pause and recovery path remains
+supported.
 
 ### Persistent frontier and safe queue reset
 
@@ -193,6 +200,35 @@ not changed so an upgrade does not discard pending requests. The old
 `NoticedURL.StackType.CANADIAN` and `CrawlQueues.canadianCrawlJobSize()` names
 are deprecated compatibility aliases only; new integrations should use the
 generic focused names.
+
+## Memory accounting
+
+The status JSON includes JVM heap use and headroom, individual heap pools,
+cumulative GC activity, direct and mapped buffer pools, live thread count, OS
+physical memory available and swap, plus per-profile sidecar diagnostics. Each sidecar
+reports record count, backing-file bytes, cache entries where applicable, and
+an estimated in-memory key-index size. The estimate comes from YaCy's mutable
+`MapHeap` index: its value cache is bounded, but the key-to-file-offset index
+is resident in memory and grows with active records. These numbers are
+diagnostic estimates, not a replacement for a low-load JVM histogram or heap
+dump when an operator needs class-level attribution.
+
+Pre-fetch classifications now stay in a fixed-size hot cache until native YaCy
+queue admission succeeds. Admitted URL metadata is removed when the URL reaches
+a terminal indexed, duplicate, or failure outcome. Parent relevance continues
+to come from the durable focused frontier after per-URL metadata is retired.
+Successfully indexed URLs are also removed from the profile admission ledger;
+the normal index timestamp and crawl-profile recrawl rules remain authoritative
+for future refresh eligibility. Profile reload and shutdown close policy-owned
+MapHeap instances so a reload cannot leave old per-profile key indexes resident.
+
+Deleting a MapHeap row removes its live key-index entry, but does not guarantee
+that the backing file shrinks immediately. Do not tune JVM heap or focused queue
+targets from file size alone. First compare reported key-index estimates and
+GC/heap-pool data with queue depth, pause history, host swap activity, and
+search latency over a sustained run. A different on-disk index format or
+sidecar compaction strategy should be considered only if measurements show the
+focused stores are a material part of the memory pressure.
 
 ## Review boundaries
 

@@ -65,4 +65,23 @@ public class FocusedCrawlPolicyManagerTest {
             manager.close();
         }
     }
+
+    @Test
+    public void dataProfileOverridesDefaultProfileWithOneStatusEntry() throws Exception {
+        final Path application = Files.createTempDirectory("focused-default-override-app-");
+        final Path data = Files.createTempDirectory("focused-default-override-data-");
+        final Path defaults = application.resolve("defaults/focused/policies");
+        final Path overrides = data.resolve("DATA/SETTINGS/focused/policies");
+        Files.createDirectories(defaults);
+        Files.createDirectories(overrides);
+        Files.writeString(defaults.resolve("astronomy.json"), profile("astronomy", false).toString(),
+                StandardCharsets.UTF_8);
+        Files.writeString(overrides.resolve("astronomy.json"), profile("astronomy", true)
+                .put("version", "2").toString(), StandardCharsets.UTF_8);
+
+        try (FocusedCrawlPolicyManager manager = new FocusedCrawlPolicyManager(application.toFile(), data.toFile())) {
+            assertEquals("2", manager.policy("astronomy").configuration().version());
+            assertEquals(1, manager.stateStatusJSON().getJSONArray("profiles").length());
+        }
+    }
 }

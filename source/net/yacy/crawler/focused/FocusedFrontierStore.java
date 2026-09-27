@@ -16,6 +16,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import net.yacy.cora.document.id.DigestURL;
 import net.yacy.cora.order.NaturalOrder;
 import net.yacy.cora.util.SpaceExceededException;
@@ -203,17 +206,18 @@ public final class FocusedFrontierStore implements AutoCloseable {
     private static final String LIST_SEPARATOR = "\u001f";
 
     private final MapHeap heap;
+    private final File heapFile;
     private final String profileId;
     private final Object staleScanLock = new Object();
     private Iterator<Map.Entry<byte[], Map<String, String>>> staleScan;
 
     public FocusedFrontierStore(final File stateDirectory, final String profileId) {
         this.profileId = profileId == null ? "" : profileId;
+        this.heapFile = stateDirectory == null ? null : new File(stateDirectory, this.profileId + ".frontier.heap");
         MapHeap opened = null;
         try {
             if (stateDirectory != null) stateDirectory.mkdirs();
-            final File file = new File(stateDirectory, this.profileId + ".frontier.heap");
-            opened = new MapHeap(file, Word.commonHashLength, NaturalOrder.naturalOrder,
+            opened = new MapHeap(this.heapFile, Word.commonHashLength, NaturalOrder.naturalOrder,
                     1024 * 128, 512, ' ');
         } catch (final IOException ignored) { }
         this.heap = opened;
@@ -421,6 +425,20 @@ public final class FocusedFrontierStore implements AutoCloseable {
     }
 
     public synchronized int size() { return this.heap == null ? 0 : this.heap.size(); }
+
+    /** Estimated RAM index and on-disk size for diagnostics. */
+    public synchronized JSONObject statusJSON() {
+        final JSONObject status = new JSONObject(true);
+        try {
+            status.put("records", this.heap == null ? 0 : this.heap.size())
+                    .put("estimatedIndexBytes", this.heap == null ? 0L : this.heap.memoryBytes())
+                    .put("heapFileBytes", this.heapFile != null && this.heapFile.isFile() ? this.heapFile.length() : 0L)
+                    .put("mapHeapCacheEntries", this.heap == null ? 0 : this.heap.cacheSize());
+        } catch (final JSONException e) {
+            throw new IllegalStateException("cannot serialize focused frontier status", e);
+        }
+        return status;
+    }
 
     public synchronized Candidate get(final byte[] hash) {
         if (this.heap == null || hash == null) return null;

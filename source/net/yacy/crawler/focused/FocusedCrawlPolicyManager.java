@@ -43,21 +43,23 @@ public final class FocusedCrawlPolicyManager implements AutoCloseable {
     }
 
     public synchronized void reload() {
-        final Map<String, FocusedCrawlPolicy> loaded = new LinkedHashMap<>();
+        closePolicies();
+        final Map<String, PolicyConfiguration> configurations = new LinkedHashMap<>();
         final Map<String, String> errors = new LinkedHashMap<>();
-        loadDirectory(new File(this.applicationDirectory, "defaults/focused/policies"), loaded, errors);
-        loadDirectory(new File(this.dataDirectory, "DATA/SETTINGS/focused/policies"), loaded, errors);
+        loadDirectory(new File(this.applicationDirectory, "defaults/focused/policies"), configurations, errors);
+        loadDirectory(new File(this.dataDirectory, "DATA/SETTINGS/focused/policies"), configurations, errors);
+        final Map<String, FocusedCrawlPolicy> loaded = new LinkedHashMap<>();
+        for (final PolicyConfiguration configuration : configurations.values()) {
+            loaded.put(configuration.id(), new RuleBasedCrawlPolicy(configuration,
+                    new File(this.dataDirectory, "DATA/SETTINGS/focused/state")));
+        }
         this.policies.clear();
         this.policies.putAll(loaded);
         this.loadErrors.clear();
         this.loadErrors.putAll(errors);
     }
 
-    private void loadDirectory(final File directory, final Map<String, FocusedCrawlPolicy> target) {
-        loadDirectory(directory, target, this.loadErrors);
-    }
-
-    private void loadDirectory(final File directory, final Map<String, FocusedCrawlPolicy> target,
+    private void loadDirectory(final File directory, final Map<String, PolicyConfiguration> target,
             final Map<String, String> errors) {
         if (!directory.isDirectory()) return;
         final File[] files = directory.listFiles((dir, name) -> name.endsWith(".json"));
@@ -65,8 +67,11 @@ public final class FocusedCrawlPolicyManager implements AutoCloseable {
         for (final File file : files) {
             try {
                 final PolicyConfiguration configuration = PolicyConfiguration.load(file);
-                target.put(configuration.id(), new RuleBasedCrawlPolicy(configuration,
-                        new File(this.dataDirectory, "DATA/SETTINGS/focused/state")));
+                // Resolve all overrides before constructing policies. Their
+                // persistent MapHeap stores can be large, so opening the
+                // built-in policy and then the same user's override would
+                // needlessly map the same sidecar twice during reload.
+                target.put(configuration.id(), configuration);
             } catch (IOException | JSONException | IllegalArgumentException e) {
                 errors.put(file.getName(), e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
             }
@@ -98,13 +103,49 @@ public final class FocusedCrawlPolicyManager implements AutoCloseable {
 
     public FocusedCrawlMetrics metrics() { return this.metrics; }
 
+    /** Report bounded-cache and disk-backed focused state diagnostics. */
+    public synchronized JSONObject stateStatusJSON() {
+        final JSONObject result = new JSONObject(true);
+        final org.json.JSONArray profileStates = new org.json.JSONArray();
+        try {
+            result.put("metadata", this.metadataStore.statusJSON());
+            for (final FocusedCrawlPolicy policy : this.policies.values()) {
+                if (policy instanceof RuleBasedCrawlPolicy) {
+                    final JSONObject profileState = ((RuleBasedCrawlPolicy) policy).stateStatusJSON();
+                    final FocusedFrontierStore frontier = this.frontiers.get(policy.configuration().id());
+                    if (frontier != null) profileState.put("frontier", frontier.statusJSON());
+                    profileStates.put(profileState);
+                }
+            }
+            result.put("profiles", profileStates);
+        } catch (final JSONException e) {
+            throw new IllegalStateException("cannot serialize focused state diagnostics", e);
+        }
+        return result;
+    }
+
     /** Close persistent sidecar stores during YaCy shutdown. */
     @Override
     public synchronized void close() {
         for (final FocusedFrontierStore frontier : this.frontiers.values()) frontier.close();
         this.frontiers.clear();
+        closePolicies();
         this.metrics.flush();
         this.metadataStore.close();
+    }
+
+    private void closePolicies() {
+        for (final FocusedCrawlPolicy policy : this.policies.values()) {
+            closePolicy(policy);
+        }
+        this.policies.clear();
+    }
+
+    private static void closePolicy(final FocusedCrawlPolicy policy) {
+        if (policy instanceof AutoCloseable) {
+            try { ((AutoCloseable) policy).close(); }
+            catch (final Exception ignored) { }
+        }
     }
 
     /** Get the persistent URL frontier for one focused profile. */
@@ -144,12 +185,16 @@ public final class FocusedCrawlPolicyManager implements AutoCloseable {
     }
 
     public void recordPreFetch(final byte[] urlHash, final List<CrawlPolicyDecision> decisions) {
-        this.metadataStore.record(urlHash, decisions);
+        // Many candidates are rejected or never admitted. Retain their
+        // decision only in the bounded hot cache; the persistent key index
+        // should describe actual native queue work, not every link examined.
+        this.metadataStore.remember(urlHash, decisions);
     }
 
     /** Record successful native queue admission for each matching profile. */
     public void recordAdmission(final CrawlPolicyContext context, final List<CrawlPolicyDecision> decisions) {
         if (context == null || decisions == null || decisions.isEmpty()) return;
+        this.metadataStore.record(context.url().hash(), decisions);
         for (final FocusedCrawlPolicy policy : enabledPolicies()) {
             for (final CrawlPolicyDecision decision : decisions) {
                 if (decision != null && policy.configuration().id().equals(decision.policyId())) {
@@ -168,7 +213,8 @@ public final class FocusedCrawlPolicyManager implements AutoCloseable {
     }
 
     /** Record a native queue push rejected after policy evaluation. */
-    public void recordAdmissionRejected(final List<CrawlPolicyDecision> decisions) {
+    public void recordAdmissionRejected(final byte[] urlHash, final List<CrawlPolicyDecision> decisions) {
+        this.metadataStore.forget(urlHash);
         if (decisions == null) return;
         for (final CrawlPolicyDecision decision : decisions) {
             if (decision != null && decision.action() != CrawlPolicyDecision.Action.REJECT && decision.focused()) {
@@ -179,16 +225,31 @@ public final class FocusedCrawlPolicyManager implements AutoCloseable {
 
     public int parentScore(final byte[] urlHash) {
         final FocusedCrawlMetadata metadata = this.metadataStore.get(urlHash);
-        if (metadata == null) return 0;
         int score = 0;
         final Collection<FocusedCrawlPolicy> enabled = enabledPolicies();
-        for (int i = 0; i < metadata.policyIds().size(); i++) {
-            final String id = metadata.policyIds().get(i);
-            final String version = i < metadata.policyVersions().size() ? metadata.policyVersions().get(i) : "";
+        if (metadata != null) {
+            for (int i = 0; i < metadata.policyIds().size(); i++) {
+                final String id = metadata.policyIds().get(i);
+                final String version = i < metadata.policyVersions().size() ? metadata.policyVersions().get(i) : "";
+                for (final FocusedCrawlPolicy policy : enabled) {
+                    if (policy.configuration().id().equals(id) && policy.configuration().version().equals(version)) {
+                        score = Math.max(score, metadata.relevanceScore());
+                        break;
+                    }
+                }
+            }
+        }
+        if (score == 0 && urlHash != null) {
+            // Terminal metadata is removed from the hot per-URL store. The
+            // durable frontier retains its score for parent inheritance.
             for (final FocusedCrawlPolicy policy : enabled) {
-                if (policy.configuration().id().equals(id) && policy.configuration().version().equals(version)) {
-                    score = Math.max(score, metadata.relevanceScore());
-                    break;
+                if (!frontierEnabled(policy.configuration().id())) continue;
+                // Open lazily after restart so terminal frontier scores remain
+                // available even before the scheduler's first control tick.
+                final FocusedFrontierStore frontier = frontier(policy.configuration().id());
+                final FocusedFrontierStore.Candidate candidate = frontier == null ? null : frontier.get(urlHash);
+                if (candidate != null && candidate.version().equals(policy.configuration().version())) {
+                    score = Math.max(score, candidate.relevance());
                 }
             }
         }
@@ -204,6 +265,7 @@ public final class FocusedCrawlPolicyManager implements AutoCloseable {
             if (frontier != null) frontier.markDuplicate(urlHash);
         }
         clearRecovery(urlHash);
+        this.metadataStore.forget(urlHash);
     }
 
     public void recordFailure(final byte[] urlHash) {
@@ -215,6 +277,7 @@ public final class FocusedCrawlPolicyManager implements AutoCloseable {
             if (frontier != null) frontier.markFailed(urlHash, 3600000L);
         }
         clearRecovery(urlHash);
+        this.metadataStore.forget(urlHash);
     }
 
     /** Mark a native worker request as in flight. */
@@ -232,10 +295,13 @@ public final class FocusedCrawlPolicyManager implements AutoCloseable {
         final FocusedCrawlMetadata metadata = this.metadataStore.get(urlHash);
         if (metadata == null) return;
         for (final String id : metadata.policyIds()) {
+            final FocusedCrawlPolicy policy = policy(id);
+            if (policy != null) policy.recordIndexed(urlHash);
             final FocusedFrontierStore frontier = frontierEnabled(id) ? frontier(id) : null;
             if (frontier != null) frontier.markIndexed(urlHash);
         }
         clearRecovery(urlHash);
+        this.metadataStore.forget(urlHash);
     }
 
     public boolean frontierEnabled(final String policyId) {

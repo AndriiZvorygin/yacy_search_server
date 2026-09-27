@@ -77,4 +77,18 @@ public class FocusedURLAdmissionStateTest {
         assertTrue(state.shouldSuppress(url.hash(), "1", pending, 0L, false, 3600000L));
         state.close();
     }
+
+    @Test
+    public void terminalIndexedAdmissionCanBeRemovedFromPersistentLedger() throws Exception {
+        final java.io.File directory = Files.createTempDirectory("focused-admission-terminal-").toFile();
+        final DigestURL url = new DigestURL("https://research.example/astronomy/finished");
+        final FocusedURLAdmissionState state = new FocusedURLAdmissionState(directory, "astronomy");
+        state.recordAdmission(url, "1");
+        assertEquals(1, state.statusJSON().optInt("records", -1));
+        state.forget(url.hash());
+        assertEquals(0, state.statusJSON().optInt("records", -1));
+        assertFalse(state.shouldSuppress(url.hash(), "1",
+                new CrawlPolicyContext(url, null, 0, "", "", 0, null), 0L, false, 3600000L));
+        state.close();
+    }
 }

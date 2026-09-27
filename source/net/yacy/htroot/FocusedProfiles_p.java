@@ -49,10 +49,12 @@ public class FocusedProfiles_p {
                     prop.putHTML("message", "Focused profiles reloaded");
                 } else if (post.containsKey("pause")) {
                     sb.setConfig("focused.autocrawler.paused", true);
+                    sb.setConfig("focused.autocrawler.operatorPaused", true);
                     sb.initFocusedAutocrawl();
                     prop.putHTML("message", "Focused profile scheduling paused");
                 } else if (post.containsKey("resume")) {
                     sb.setConfig("focused.autocrawler.paused", false);
+                    sb.setConfig("focused.autocrawler.operatorPaused", false);
                     sb.initFocusedAutocrawl();
                     prop.putHTML("message", "Focused profile scheduling resumed");
                 } else if (post.containsKey("validate")) {
@@ -106,6 +108,9 @@ public class FocusedProfiles_p {
         prop.putJSON("status", schedulerStatus.toString());
         final JSONObject resourceStatus = schedulerStatus.optJSONObject("resource");
         final JSONObject pdfStatus = schedulerStatus.optJSONObject("pdfLane");
+        final JSONObject runtimeStatus = resourceStatus == null ? null : resourceStatus.optJSONObject("runtime");
+        final JSONObject stateStores = schedulerStatus.optJSONObject("stateStores");
+        final JSONObject metadataStore = stateStores == null ? null : stateStores.optJSONObject("metadata");
         prop.putHTML("resource_pause_cause", resourceStatus == null ? "" : resourceStatus.optString("pauseCause", ""));
         prop.put("resource_paused", resourceStatus != null && resourceStatus.optBoolean("paused", false));
         prop.put("resource_memory_available", resourceStatus == null ? 0L : resourceStatus.optLong("memoryAvailable", 0L));
@@ -113,6 +118,31 @@ public class FocusedProfiles_p {
                 resourceStatus.optLong("memoryThreshold", 0L)));
         prop.put("resource_memory_recovery_threshold", resourceStatus == null ? 0L
                 : resourceStatus.optLong("memoryRecoveryThreshold", 0L));
+        prop.put("runtime_heap_used", runtimeStatus == null ? 0L : runtimeStatus.optLong("heapUsed", 0L));
+        prop.put("runtime_heap_committed", runtimeStatus == null ? 0L : runtimeStatus.optLong("heapCommitted", 0L));
+        prop.put("runtime_heap_maximum", runtimeStatus == null ? 0L : runtimeStatus.optLong("heapMaximum", 0L));
+        prop.put("runtime_gc_millis", runtimeStatus == null ? 0L : runtimeStatus.optLong("gcCollectionMillis", 0L));
+        prop.put("runtime_physical_free", runtimeStatus == null ? 0L : runtimeStatus.optLong("physicalMemoryAvailable", 0L));
+        prop.put("runtime_physical_threshold", runtimeStatus == null ? 0L : runtimeStatus.optLong("physicalMemoryPauseThreshold", 0L));
+        prop.put("runtime_system_memory_healthy", runtimeStatus == null || runtimeStatus.optBoolean("systemMemoryHealthy", true));
+        prop.put("runtime_swap_free", runtimeStatus == null ? 0L : runtimeStatus.optLong("swapFree", 0L));
+        prop.put("runtime_live_threads", runtimeStatus == null ? 0 : runtimeStatus.optInt("liveThreads", 0));
+        long directBufferBytes = 0L;
+        long mappedBufferBytes = 0L;
+        final JSONArray bufferPools = runtimeStatus == null ? null : runtimeStatus.optJSONArray("bufferPools");
+        if (bufferPools != null) {
+            for (int bufferIndex = 0; bufferIndex < bufferPools.length(); bufferIndex++) {
+                final JSONObject buffer = bufferPools.optJSONObject(bufferIndex);
+                if (buffer == null) continue;
+                if ("direct".equals(buffer.optString("name"))) directBufferBytes += Math.max(0L, buffer.optLong("usedBytes", 0L));
+                if ("mapped".equals(buffer.optString("name"))) mappedBufferBytes += Math.max(0L, buffer.optLong("usedBytes", 0L));
+            }
+        }
+        prop.put("runtime_direct_buffer_bytes", directBufferBytes);
+        prop.put("runtime_mapped_buffer_bytes", mappedBufferBytes);
+        prop.put("state_metadata_records", metadataStore == null ? 0 : metadataStore.optInt("records", 0));
+        prop.put("state_metadata_index_bytes", metadataStore == null ? 0L : metadataStore.optLong("estimatedIndexBytes", 0L));
+        prop.put("state_metadata_file_bytes", metadataStore == null ? 0L : metadataStore.optLong("heapFileBytes", 0L));
         prop.put("resource_healthy_checks", resourceStatus == null ? 0 : resourceStatus.optInt("healthyChecks", 0));
         prop.put("pdf_active", pdfStatus == null ? 0 : pdfStatus.optInt("active", 0));
         prop.put("pdf_admitted", pdfStatus == null ? 0L : pdfStatus.optLong("admitted", 0L));

@@ -14,6 +14,8 @@ import net.yacy.cora.order.NaturalOrder;
 import net.yacy.cora.util.SpaceExceededException;
 import net.yacy.kelondro.blob.MapHeap;
 import net.yacy.kelondro.data.word.Word;
+import org.json.JSONException;
+import org.json.JSONObject;
 
 /**
  * Crash-safe URL admission ledger for one focused profile. It records URLs
@@ -26,15 +28,30 @@ public final class FocusedURLAdmissionState implements AutoCloseable {
     private static final String VERSION = "version";
 
     private final MapHeap heap;
+    private final File heapFile;
 
     public FocusedURLAdmissionState(final File stateDirectory, final String policyId) {
+        this.heapFile = stateDirectory == null ? null : new File(stateDirectory, policyId + ".admission.heap");
         MapHeap opened = null;
         try {
-            stateDirectory.mkdirs();
-            opened = new MapHeap(new File(stateDirectory, policyId + ".admission.heap"),
+            if (stateDirectory != null) stateDirectory.mkdirs();
+            if (this.heapFile != null) opened = new MapHeap(this.heapFile,
                     Word.commonHashLength, NaturalOrder.naturalOrder, 1024 * 64, 512, ' ');
         } catch (final IOException ignored) { }
         this.heap = opened;
+    }
+
+    public synchronized JSONObject statusJSON() {
+        final JSONObject status = new JSONObject(true);
+        try {
+            status.put("records", this.heap == null ? 0 : this.heap.size())
+                    .put("estimatedIndexBytes", this.heap == null ? 0L : this.heap.memoryBytes())
+                    .put("heapFileBytes", this.heapFile != null && this.heapFile.isFile() ? this.heapFile.length() : 0L)
+                    .put("mapHeapCacheEntries", this.heap == null ? 0 : this.heap.cacheSize());
+        } catch (final JSONException e) {
+            throw new IllegalStateException("cannot serialize focused admission state", e);
+        }
+        return status;
     }
 
     /**
@@ -69,6 +86,13 @@ public final class FocusedURLAdmissionState implements AutoCloseable {
         state.put(VERSION, policyVersion == null ? "" : policyVersion);
         state.put(LAST_ADMITTED, Long.toString(System.currentTimeMillis()));
         write(urlHash, state);
+    }
+
+    /** Remove a URL once it is indexed; the index now enforces normal recrawl eligibility. */
+    public synchronized void forget(final byte[] urlHash) {
+        if (this.heap == null || urlHash == null) return;
+        try { this.heap.delete(storageKey(urlHash)); }
+        catch (final IOException | RuntimeException ignored) { }
     }
 
     @Override

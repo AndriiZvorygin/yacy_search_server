@@ -16,4 +16,9 @@ public interface FocusedCrawlPolicy {
     default void recordAdmission(final CrawlPolicyContext context, final CrawlPolicyDecision decision) {
         // Optional hook for stateful policies.
     }
+
+    /** Called after YaCy has stored the fetched document in its local index. */
+    default void recordIndexed(final byte[] urlHash) {
+        // Optional hook for policy-owned terminal state.
+    }
 }

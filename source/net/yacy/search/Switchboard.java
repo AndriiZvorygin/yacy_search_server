@@ -143,6 +143,7 @@ import net.yacy.crawler.focused.CrawlPolicyDecision;
 import net.yacy.crawler.focused.FocusedCrawlMetadata;
 import net.yacy.crawler.focused.FocusedCrawlPolicyManager;
 import net.yacy.crawler.focused.FocusedCrawlScheduler;
+import net.yacy.crawler.focused.FocusedResourceGuard;
 import net.yacy.crawler.HarvestProcess;
 import net.yacy.crawler.data.Cache;
 import net.yacy.crawler.data.CrawlProfile;
@@ -939,14 +940,36 @@ public final class Switchboard extends serverSwitch {
         }
         this.crawlQueues = new CrawlQueues(this, this.queuesRoot);
 
-        // on startup, resume all crawls
-        this.setConfig(SwitchboardConstants.CRAWLJOB_LOCAL_CRAWL + "_isPaused", "false");
-        this.setConfig(SwitchboardConstants.CRAWLJOB_LOCAL_CRAWL + "_isPaused_cause", "");
+        // Preserve a resource-guard pause across restart. The focused
+        // scheduler remains active as a recovery monitor and only resumes
+        // the native queue after consecutive healthy resource checks.
+        final String localPauseKey = SwitchboardConstants.CRAWLJOB_LOCAL_CRAWL + "_isPaused";
+        final String localPauseCauseKey = SwitchboardConstants.CRAWLJOB_LOCAL_CRAWL + "_isPaused_cause";
+        final boolean preserveLocalPause = FocusedResourceGuard.preservePauseOnStartup(
+                this.getConfigBool(localPauseKey, false),
+                this.getConfigBool(SwitchboardConstants.CRAWLJOB_LOCAL_AUTODISABLED, false),
+                this.getConfig(localPauseCauseKey, ""));
+        if (!preserveLocalPause) {
+            this.setConfig(localPauseKey, "false");
+            this.setConfig(localPauseCauseKey, "");
+        } else {
+            final boolean operatorPaused = this.getConfigBool("focused.autocrawler.operatorPaused", false);
+            final boolean autoResume = FocusedResourceGuard.autoResumeOnStartup(true, operatorPaused);
+            this.setConfig("focused.autocrawler.paused", !autoResume);
+            if (autoResume) {
+                this.log.warn("Keeping the native local queue paused after a persisted resource guard; "
+                        + "the focused scheduler will monitor recovery and resume only after healthy checks");
+            } else {
+                this.log.warn("Keeping local crawling paused after restart because the operator paused "
+                        + "focused scheduling");
+            }
+        }
         this.setConfig(SwitchboardConstants.CRAWLJOB_REMOTE_TRIGGERED_CRAWL + "_isPaused", "false");
         this.setConfig(SwitchboardConstants.CRAWLJOB_REMOTE_TRIGGERED_CRAWL + "_isPaused_cause", "");
         this.setConfig(SwitchboardConstants.CRAWLJOB_REMOTE_CRAWL_LOADER + "_isPaused", "false");
         this.setConfig(SwitchboardConstants.CRAWLJOB_REMOTE_CRAWL_LOADER + "_isPaused_cause", "");
-        this.crawlJobsStatus.put(SwitchboardConstants.CRAWLJOB_LOCAL_CRAWL, new Object[] {new Object(), false});
+        this.crawlJobsStatus.put(SwitchboardConstants.CRAWLJOB_LOCAL_CRAWL,
+                new Object[] {new Object(), preserveLocalPause});
         this.crawlJobsStatus.put(SwitchboardConstants.CRAWLJOB_REMOTE_TRIGGERED_CRAWL, new Object[] {new Object(), false});
         this.crawlJobsStatus.put(SwitchboardConstants.CRAWLJOB_REMOTE_CRAWL_LOADER, new Object[] {new Object(), false});
 
@@ -1572,8 +1595,8 @@ public final class Switchboard extends serverSwitch {
         Domains.setNoLocalCheck(this.isAllIPMode()); // possibly switch off localIP check
 
         // start up crawl jobs
-        this.continueCrawlJob(SwitchboardConstants.CRAWLJOB_LOCAL_CRAWL);
-        this.continueCrawlJob(SwitchboardConstants.CRAWLJOB_REMOTE_TRIGGERED_CRAWL);
+        if (!lcp) this.continueCrawlJob(SwitchboardConstants.CRAWLJOB_LOCAL_CRAWL);
+        if (!rcp) this.continueCrawlJob(SwitchboardConstants.CRAWLJOB_REMOTE_TRIGGERED_CRAWL);
         this.log
         .info("SWITCH NETWORK: FINISHED START UP, new network is now '" + networkDefinition + "'.");
 

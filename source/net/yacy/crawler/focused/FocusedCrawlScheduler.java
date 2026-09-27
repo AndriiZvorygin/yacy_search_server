@@ -6,6 +6,11 @@ import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.File;
 import java.io.IOException;
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.BufferPoolMXBean;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryPoolMXBean;
+import java.lang.management.MemoryUsage;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
@@ -744,8 +749,10 @@ public final class FocusedCrawlScheduler {
     }
 
     private boolean memoryHealthy() {
+        final SystemMemorySnapshot systemMemory = SystemMemorySnapshot.read();
         return !MemoryControl.shortStatus()
-                && MemoryControl.available() >= FocusedResourceGuard.refillThreshold(MemoryControl.maxMemory());
+                && MemoryControl.available() >= FocusedResourceGuard.refillThreshold(MemoryControl.maxMemory())
+                && systemMemory.healthy();
     }
 
     /**
@@ -767,16 +774,25 @@ public final class FocusedCrawlScheduler {
             MemoryControl.request(threshold, false);
             available = MemoryControl.available();
         }
-        if (!FocusedResourceGuard.shouldPause(available, maximum, MemoryControl.shortStatus())) return false;
+        final SystemMemorySnapshot systemMemory = SystemMemorySnapshot.read();
+        final boolean jvmPressure = FocusedResourceGuard.shouldPause(available, maximum, MemoryControl.shortStatus());
+        if (!jvmPressure && systemMemory.healthy()) return false;
 
         final String jobType = SwitchboardConstants.CRAWLJOB_LOCAL_CRAWL;
         if (!this.sb.crawlJobIsPaused(jobType)) {
-            final String cause = "focused resource guard: JVM headroom " + available
-                    + " bytes is below " + threshold + " bytes";
+            final String cause;
+            if (!systemMemory.healthy()) {
+                cause = systemMemory.pauseReason();
+            } else if (MemoryControl.shortStatus()) {
+                cause = "focused resource guard: JVM reported a failed memory request; current headroom "
+                        + available + " bytes";
+            } else {
+                cause = "focused resource guard: JVM headroom " + available
+                        + " bytes is below " + threshold + " bytes";
+            }
             this.sb.setConfig(SwitchboardConstants.CRAWLJOB_LOCAL_AUTODISABLED, true);
             this.sb.pauseCrawlJob(jobType, cause);
-            LOG.warn("Paused local crawling for focused-profile memory headroom: available="
-                    + available + ", threshold=" + threshold);
+            LOG.warn("Paused local crawling for focused-profile resource pressure: " + cause);
         }
 
         this.resourceState.setProperty("lastCheck", Long.toString(System.currentTimeMillis()));
@@ -790,6 +806,7 @@ public final class FocusedCrawlScheduler {
         this.resourceState.setProperty("memoryShort", Boolean.toString(MemoryControl.shortStatus()));
         this.resourceState.setProperty("memoryProper", Boolean.toString(MemoryControl.properState()));
         this.resourceState.setProperty("diskHealthy", Boolean.toString(diskHealthy(null)));
+        systemMemory.save(this.resourceState);
         persistResourceState();
         return true;
     }
@@ -810,7 +827,7 @@ public final class FocusedCrawlScheduler {
     private void recoverResourceObserverPause() {
         final String jobType = SwitchboardConstants.CRAWLJOB_LOCAL_CRAWL;
         final boolean paused = this.sb.crawlJobIsPaused(jobType);
-        final String cause = this.sb.getConfig(jobType + "_isPaused_cause", "");
+        String cause = this.sb.getConfig(jobType + "_isPaused_cause", "");
         long available = MemoryControl.available();
         final long maximum = MemoryControl.maxMemory();
         // A previous failed allocation sets a sticky short-status bit. Once
@@ -823,13 +840,20 @@ public final class FocusedCrawlScheduler {
             available = MemoryControl.available();
         }
         final boolean disk = diskHealthy(null);
+        final SystemMemorySnapshot systemMemory = SystemMemorySnapshot.read();
         final boolean recover;
         if (managedPause) {
             recover = this.resourceGuard.observe(cause, available, maximum,
-                    MemoryControl.shortStatus(), disk);
+                    MemoryControl.shortStatus(), disk && systemMemory.healthy());
         } else {
             this.resourceGuard.reset();
             recover = false;
+        }
+        if (managedPause && !recover) {
+            cause = FocusedResourceGuard.recoveryPauseCause(cause, available, maximum,
+                    systemMemory.physicalAvailable, systemMemory.physicalTotal,
+                    systemMemory.swapFree, systemMemory.swapTotal, disk);
+            this.sb.setConfig(jobType + "_isPaused_cause", cause);
         }
         this.resourceState.setProperty("lastCheck", Long.toString(System.currentTimeMillis()));
         this.resourceState.setProperty("paused", Boolean.toString(paused));
@@ -842,6 +866,8 @@ public final class FocusedCrawlScheduler {
         this.resourceState.setProperty("memoryShort", Boolean.toString(MemoryControl.shortStatus()));
         this.resourceState.setProperty("memoryProper", Boolean.toString(MemoryControl.properState()));
         this.resourceState.setProperty("diskHealthy", Boolean.toString(disk));
+        systemMemory.save(this.resourceState);
+        this.resourceState.setProperty("systemMemoryHealthy", Boolean.toString(systemMemory.healthy()));
         this.resourceState.setProperty("healthyChecks", Integer.toString(this.resourceGuard.healthyChecks()));
         this.resourceState.setProperty("recoveryAttempts", Long.toString(this.resourceGuard.recoveryAttempts()));
         this.resourceState.setProperty("recoveries", Long.toString(this.resourceGuard.recoveries()));
@@ -1034,12 +1060,147 @@ public final class FocusedCrawlScheduler {
                     .put("healthyChecks", this.resourceGuard.healthyChecks())
                     .put("recoveryAttempts", this.resourceGuard.recoveryAttempts())
                     .put("recoveries", this.resourceGuard.recoveries());
+            final JSONObject runtime = runtimeMemoryJSON();
+            resource.put("runtime", runtime)
+                    .put("systemMemoryHealthy", runtime.optBoolean("systemMemoryHealthy", true));
             json.put("feature", "Focused Autocrawler Profiles").put("owner", isOwner()).put("profiles", profilesJSON)
-                    .put("resource", resource).put("pdfLane", this.sb.crawlQueues.focusedPdfLane().toJSON());
+                    .put("resource", resource)
+                    .put("stateStores", this.manager.stateStatusJSON())
+                    .put("pdfLane", this.sb.crawlQueues.focusedPdfLane().toJSON());
         } catch (final JSONException e) {
             throw new IllegalStateException("cannot serialize focused scheduler status", e);
         }
         return json;
+    }
+
+    /** JVM, GC, physical-memory and swap counters for resource diagnosis. */
+    private static JSONObject runtimeMemoryJSON() throws JSONException {
+        final JSONObject runtime = new JSONObject(true);
+        final SystemMemorySnapshot systemMemory = SystemMemorySnapshot.read();
+        final MemoryUsage heap = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+        runtime.put("heapUsed", heap.getUsed())
+                .put("heapCommitted", heap.getCommitted())
+                .put("heapMaximum", heap.getMax())
+                .put("heapHeadroom", heap.getMax() < 0L ? -1L : Math.max(0L, heap.getMax() - heap.getUsed()));
+
+        final org.json.JSONArray pools = new org.json.JSONArray();
+        for (final MemoryPoolMXBean pool : ManagementFactory.getMemoryPoolMXBeans()) {
+            final MemoryUsage usage = pool.getUsage();
+            if (usage == null) continue;
+            final JSONObject row = new JSONObject(true);
+            row.put("name", pool.getName()).put("used", usage.getUsed())
+                    .put("committed", usage.getCommitted()).put("maximum", usage.getMax());
+            pools.put(row);
+        }
+        runtime.put("memoryPools", pools);
+
+        final org.json.JSONArray buffers = new org.json.JSONArray();
+        for (final BufferPoolMXBean bufferPool : ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class)) {
+            final JSONObject row = new JSONObject(true);
+            row.put("name", bufferPool.getName()).put("count", bufferPool.getCount())
+                    .put("usedBytes", bufferPool.getMemoryUsed()).put("capacityBytes", bufferPool.getTotalCapacity());
+            buffers.put(row);
+        }
+        runtime.put("bufferPools", buffers)
+                .put("liveThreads", ManagementFactory.getThreadMXBean().getThreadCount());
+
+        long collections = 0L;
+        long collectionMillis = 0L;
+        for (final GarbageCollectorMXBean collector : ManagementFactory.getGarbageCollectorMXBeans()) {
+            if (collector.getCollectionCount() >= 0L) collections += collector.getCollectionCount();
+            if (collector.getCollectionTime() >= 0L) collectionMillis += collector.getCollectionTime();
+        }
+        runtime.put("gcCollections", collections).put("gcCollectionMillis", collectionMillis);
+
+        runtime.put("physicalMemoryTotal", systemMemory.physicalTotal)
+                .put("physicalMemoryFree", systemMemory.physicalFree)
+                .put("physicalMemoryAvailable", systemMemory.physicalAvailable)
+                .put("physicalMemoryPauseThreshold", FocusedResourceGuard.physicalMemoryThreshold(systemMemory.physicalTotal))
+                .put("systemMemoryHealthy", systemMemory.healthy())
+                .put("swapTotal", systemMemory.swapTotal)
+                .put("swapFree", systemMemory.swapFree);
+        return runtime;
+    }
+
+    /** Physical-memory values for resource guards and operator diagnostics. */
+    private static final class SystemMemorySnapshot {
+        private final long physicalTotal;
+        private final long physicalFree;
+        private final long physicalAvailable;
+        private final long swapTotal;
+        private final long swapFree;
+
+        private SystemMemorySnapshot(final long physicalTotal, final long physicalFree,
+                final long physicalAvailable, final long swapTotal, final long swapFree) {
+            this.physicalTotal = physicalTotal;
+            this.physicalFree = physicalFree;
+            this.physicalAvailable = physicalAvailable;
+            this.swapTotal = swapTotal;
+            this.swapFree = swapFree;
+        }
+
+        private static SystemMemorySnapshot read() {
+            long total = -1L;
+            long free = -1L;
+            long available = -1L;
+            long swapTotal = -1L;
+            long swapFree = -1L;
+            final java.lang.management.OperatingSystemMXBean operatingSystem = ManagementFactory.getOperatingSystemMXBean();
+            if (operatingSystem instanceof com.sun.management.OperatingSystemMXBean) {
+                final com.sun.management.OperatingSystemMXBean extended =
+                        (com.sun.management.OperatingSystemMXBean) operatingSystem;
+                total = extended.getTotalPhysicalMemorySize();
+                free = extended.getFreePhysicalMemorySize();
+                swapTotal = extended.getTotalSwapSpaceSize();
+                swapFree = extended.getFreeSwapSpaceSize();
+            }
+            final long linuxAvailable = linuxMemoryInfoBytes("MemAvailable:");
+            if (linuxAvailable > 0L) available = linuxAvailable;
+            else available = free;
+            return new SystemMemorySnapshot(total, free, available, swapTotal, swapFree);
+        }
+
+        private boolean healthy() {
+            return FocusedResourceGuard.systemMemoryHealthy(
+                    this.physicalAvailable, this.physicalTotal, this.swapFree, this.swapTotal);
+        }
+
+        private String pauseReason() {
+            if (this.physicalTotal > 0L && this.physicalAvailable >= 0L
+                    && this.physicalAvailable < FocusedResourceGuard.physicalMemoryThreshold(this.physicalTotal)) {
+                return "focused resource guard: physical RAM available " + this.physicalAvailable
+                        + " bytes is below " + FocusedResourceGuard.physicalMemoryThreshold(this.physicalTotal) + " bytes";
+            }
+            return "focused resource guard: swap free space is below 10%; " + this.swapFree
+                    + " of " + this.swapTotal + " bytes remains";
+        }
+
+        private void save(final Properties state) {
+            state.setProperty("physicalMemoryTotal", Long.toString(this.physicalTotal));
+            state.setProperty("physicalMemoryFree", Long.toString(this.physicalFree));
+            state.setProperty("physicalMemoryAvailable", Long.toString(this.physicalAvailable));
+            state.setProperty("physicalMemoryThreshold",
+                    Long.toString(FocusedResourceGuard.physicalMemoryThreshold(this.physicalTotal)));
+            state.setProperty("swapTotal", Long.toString(this.swapTotal));
+            state.setProperty("swapFree", Long.toString(this.swapFree));
+        }
+    }
+
+    /** Read Linux MemAvailable, which includes reclaimable cache unlike raw free RAM. */
+    private static long linuxMemoryInfoBytes(final String key) {
+        final File memInfo = new File("/proc/meminfo");
+        if (!memInfo.isFile()) return -1L;
+        try (BufferedReader reader = Files.newBufferedReader(memInfo.toPath(), StandardCharsets.US_ASCII)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (!line.startsWith(key)) continue;
+                final String value = line.substring(key.length()).trim();
+                final int separator = value.indexOf(' ');
+                final String number = separator < 0 ? value : value.substring(0, separator);
+                return Math.multiplyExact(Long.parseLong(number), 1024L);
+            }
+        } catch (final IOException | NumberFormatException | ArithmeticException ignored) { }
+        return -1L;
     }
 
     /** Drop cached CrawlProfile objects after a hot profile reload. Queue rows remain untouched. */
