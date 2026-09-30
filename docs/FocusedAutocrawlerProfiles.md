@@ -114,7 +114,11 @@ stays in place while the focused scheduler continues monitoring it; the pause
 reason is refreshed from current measurements and the scheduler resumes after
 the same two-check recovery test. An explicit operator pause remains
 authoritative. The ordinary ResourceObserver pause and recovery path remains
-supported.
+supported. Before imposing a JVM-pressure pause, the scheduler asks YaCy's
+memory controller for one forced reclamation attempt and rechecks actual
+headroom. Attempts are rate-limited to once per minute while pressure persists;
+if reclamation does not restore the safety threshold, native crawling remains
+paused until the normal recovery checks pass.
 
 ### Persistent frontier and safe queue reset
 

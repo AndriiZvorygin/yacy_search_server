@@ -87,7 +87,11 @@ pauses YaCy's native local crawl below `max(512 MiB, 25% of maximum heap)` and
 resumes only after two healthy checks above `max(768 MiB, 35% of maximum
 heap)`. This pauses already-queued fetching as well as future refills, while
 leaving the persisted queue intact. Manual pauses are never resumed by the
-guard. The core ResourceObserver remains the final fallback.
+guard. Before a JVM-pressure pause, the guard makes one forced YaCy-managed
+heap-reclamation attempt and rechecks measured headroom; it rate-limits retries
+to one per minute. If reclamation cannot restore the threshold, the native
+queue stays paused until the normal two-check recovery condition is met. The
+core ResourceObserver remains the final fallback.
 
 ## Scope and operational limits
 

@@ -13,6 +13,7 @@ public final class FocusedResourceGuard {
     private static final long MIN_RECOVERY_HEADROOM = 768L * 1024L * 1024L;
     private static final long MIN_PHYSICAL_HEADROOM = 512L * 1024L * 1024L;
     private static final int REQUIRED_HEALTHY_CHECKS = 2;
+    private static final long MEMORY_RECOVERY_RETRY_MILLIS = 60L * 1000L;
 
     private int healthyChecks;
     private long recoveryAttempts;
@@ -118,15 +119,15 @@ public final class FocusedResourceGuard {
         return shortMemory || availableMemory < pauseThreshold(maxMemory);
     }
 
-    /**
-     * A low but non-critical heap reading is an opportunity to ask YaCy's
-     * memory controller to reclaim unused heap before stopping the crawler.
-     * A sticky short-memory signal is already a failed allocation and must not
-     * be delayed by another recovery attempt.
-     */
+    /** A low heap reading or YaCy short-memory signal should trigger reclamation before a crawl pause. */
     public static boolean shouldAttemptMemoryRecovery(final long availableMemory,
             final long maxMemory, final boolean shortMemory) {
-        return !shortMemory && availableMemory < pauseThreshold(maxMemory);
+        return shortMemory || availableMemory < pauseThreshold(maxMemory);
+    }
+
+    /** Limit forced heap reclamation to once per cooldown while pressure persists. */
+    public static boolean memoryRecoveryCooldownElapsed(final long lastAttempt, final long now) {
+        return lastAttempt <= 0L || (now >= lastAttempt && now - lastAttempt >= MEMORY_RECOVERY_RETRY_MILLIS);
     }
 
     public static long recoveryThreshold(final long maxMemory) {

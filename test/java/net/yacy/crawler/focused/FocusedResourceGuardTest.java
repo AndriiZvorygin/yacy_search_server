@@ -81,12 +81,21 @@ public class FocusedResourceGuardTest {
     }
 
     @Test
-    public void marginalLowHeadroomRequestsReclamationBeforeTheSafetyPause() {
+    public void lowHeadroomOrShortMemoryRequestsReclamationBeforeTheSafetyPause() {
         final long max = 3L * 1024L * 1024L * 1024L;
         final long threshold = FocusedResourceGuard.pauseThreshold(max);
         assertTrue(FocusedResourceGuard.shouldAttemptMemoryRecovery(threshold - 1L, max, false));
         assertFalse(FocusedResourceGuard.shouldAttemptMemoryRecovery(threshold, max, false));
-        assertFalse(FocusedResourceGuard.shouldAttemptMemoryRecovery(threshold - 1L, max, true));
+        assertTrue(FocusedResourceGuard.shouldAttemptMemoryRecovery(threshold + 1L, max, true));
+        assertTrue(FocusedResourceGuard.shouldAttemptMemoryRecovery(threshold - 1L, max, true));
+    }
+
+    @Test
+    public void forcedMemoryReclamationIsRateLimitedToOneAttemptPerMinute() {
+        assertTrue(FocusedResourceGuard.memoryRecoveryCooldownElapsed(0L, 1000L));
+        assertFalse(FocusedResourceGuard.memoryRecoveryCooldownElapsed(1000L, 60999L));
+        assertTrue(FocusedResourceGuard.memoryRecoveryCooldownElapsed(1000L, 61000L));
+        assertFalse(FocusedResourceGuard.memoryRecoveryCooldownElapsed(1000L, 999L));
     }
 
     @Test
